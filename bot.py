@@ -98,6 +98,62 @@ STOP_WORDS = {
 }
 
 
+def extract_rule_codes(query):
+    """Extract FSAE rule codes like T.7.6, EV.5.3.1, F.10.4 from query."""
+    # Match patterns like T.7.6, EV.5.3.1, F.10, IC.2.4, etc.
+    pattern = r'\b([A-Z]{1,2}\.\d{1,2}(?:\.\d{1,2})*)\b'
+    codes = re.findall(pattern, query.upper())
+    return codes
+
+
+def lookup_rule_code(code):
+    """Look up a specific rule code and return surrounding context."""
+    results = []
+    seen_starts = set()
+    
+    # Pattern 1: Look for the exact code as a bold heading (e.g., **T.7.6.1**)
+    heading_pattern = rf'\*\*{re.escape(code)}(?:\.\d+)*\*\*'
+    
+    for i, line in enumerate(RULES_LINES):
+        if re.search(heading_pattern, line):
+            start = max(0, i - 3)
+            if start not in seen_starts:
+                seen_starts.add(start)
+                end = min(len(RULES_LINES), i + 15)
+                chunk = "\n".join(RULES_LINES[start:end])
+                results.append(chunk)
+    
+    # Pattern 2: Look for sub-rules (e.g., T.7.6.1 when searching for T.7.6)
+    subrule_pattern = rf'\*\*{re.escape(code)}\.\d+\*\*'
+    
+    for i, line in enumerate(RULES_LINES):
+        if re.search(subrule_pattern, line):
+            start = max(0, i - 3)
+            if start not in seen_starts:
+                seen_starts.add(start)
+                end = min(len(RULES_LINES), i + 10)
+                chunk = "\n".join(RULES_LINES[start:end])
+                results.append(chunk)
+                if len(results) >= 5:
+                    break
+    
+    # Pattern 3: Fallback - any reference to the code
+    if not results:
+        fallback_pattern = rf'{re.escape(code)}'
+        for i, line in enumerate(RULES_LINES):
+            if re.search(fallback_pattern, line, re.IGNORECASE):
+                start = max(0, i - 2)
+                if start not in seen_starts:
+                    seen_starts.add(start)
+                    end = min(len(RULES_LINES), i + 10)
+                    chunk = "\n".join(RULES_LINES[start:end])
+                    results.append(chunk)
+                    if len(results) >= 3:
+                        break
+    
+    return results
+
+
 def extract_keywords(query):
     """Extract meaningful keywords from a query, filtering stop words."""
     words = re.findall(r'[a-z0-9]+', query.lower())
@@ -289,20 +345,38 @@ async def rule_command(interaction: discord.Interaction, question: str):
 
     try:
         print(f"[RULE] Starting processing...", flush=True)
+        
+        # Step 0: Check for specific rule codes (e.g., T.7.6, EV.5.3)
+        rule_codes = extract_rule_codes(question)
+        print(f"[RULE] Rule codes found: {rule_codes}", flush=True)
+        
+        chunks = []
+        codes = []
+        
+        if rule_codes:
+            # Direct rule code lookup
+            for code in rule_codes:
+                code_chunks = lookup_rule_code(code)
+                chunks.extend(code_chunks)
+            print(f"[RULE] Found {len(chunks)} chunks from rule code lookup", flush=True)
+        
         # Step 1: Extract keywords with fuzzy correction
         keywords, corrections = extract_keywords_fuzzy(question)
         print(f"[RULE] Keywords: {keywords}", flush=True)
         
-        # Step 2: Expand query with FSAE terminology
-        print(f"[RULE] Expanding query...", flush=True)
-        expanded_terms = await expand_query(question)
-        print(f"[RULE] Expanded terms: {expanded_terms}", flush=True)
+        # Step 2: Expand query with FSAE terminology (skip if we found rule codes)
+        expanded_terms = []
+        if not chunks:
+            print(f"[RULE] Expanding query...", flush=True)
+            expanded_terms = await expand_query(question)
+            print(f"[RULE] Expanded terms: {expanded_terms}", flush=True)
         all_keywords = list(set(keywords + expanded_terms))
         
-        # Step 3: Find relevant sections
-        print(f"[RULE] Finding sections...", flush=True)
-        chunks, codes = find_relevant_sections(all_keywords)
-        print(f"[RULE] Found {len(chunks)} chunks", flush=True)
+        # Step 3: Find relevant sections (if we didn't find rule codes)
+        if not chunks:
+            print(f"[RULE] Finding sections...", flush=True)
+            chunks, codes = find_relevant_sections(all_keywords)
+            print(f"[RULE] Found {len(chunks)} chunks", flush=True)
 
         if not chunks:
             # Fallback: try broader search with just fuzzy-corrected keywords
