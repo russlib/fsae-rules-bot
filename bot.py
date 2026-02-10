@@ -198,13 +198,20 @@ Rules:
 - If there's no explicit rule with a specific number/limit, explain what implicit constraints exist (e.g., "There's no max width specified, but aero must be within tire width per T.7.6")
 - If the context genuinely doesn't help, say so and suggest what terms to search
 - If a rule references another rule, mention the cross-reference
-- At the end, add a line: "**Also check:** [list 2-3 related rule sections that might be relevant]"
-  For example: "**Also check:** F.10.4 (Holes and Openings), EV.6.1 (Covers), T.8.2 (Critical Fasteners)"
-  Only suggest sections that exist and are genuinely related."""
+
+At the end, add a **Follow-up** section with 1-3 copyable prompts for related rules:
+```
+**Follow-up prompts:**
+• `/rule What is T.7.6?`
+• `/rule What are the chassis tube requirements?`
+```
+Only suggest follow-ups that would genuinely help understand the topic better."""
 
 
 async def expand_query(question):
     """Use Gemini to expand the query with FSAE-specific terminology."""
+    import asyncio
+    
     expansion_prompt = f"""Given this question about FSAE (Formula SAE) rules, suggest 3-5 specific technical terms 
 that would appear in the official FSAE rulebook. Return ONLY the terms, comma-separated, no explanation.
 
@@ -217,7 +224,7 @@ Question: {question}
 
 Terms:"""
 
-    try:
+    def sync_call():
         response = client.models.generate_content(
             model="gemini-2.0-flash-lite",
             contents=expansion_prompt,
@@ -227,12 +234,18 @@ Terms:"""
         )
         terms = [t.strip().lower() for t in response.text.split(",")]
         return [t for t in terms if len(t) > 2][:5]
+
+    try:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, sync_call)
     except Exception:
         return []
 
 
 async def ask_gemini(question, context_chunks):
     """Send question + relevant rule sections to Gemini Flash."""
+    import asyncio
+    
     context = "\n\n---\n\n".join(context_chunks)
 
     if len(context) > 30000:
@@ -245,16 +258,20 @@ async def ask_gemini(question, context_chunks):
 **Rules Context:**
 {context}"""
 
-    response = client.models.generate_content(
-        model="gemini-2.0-flash-lite",
-        contents=prompt,
-        config=genai.types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            max_output_tokens=1800,
-        ),
-    )
-
-    return response.text
+    # Run sync Gemini call in thread pool to not block event loop
+    def sync_call():
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=prompt,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                max_output_tokens=1800,
+            ),
+        )
+        return response.text
+    
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, sync_call)
 
 
 # --- Discord bot ---
@@ -266,18 +283,26 @@ tree = app_commands.CommandTree(bot)
 @tree.command(name="rule", description="Ask a question about FSAE 2026 rules")
 @app_commands.describe(question="Your question about FSAE rules")
 async def rule_command(interaction: discord.Interaction, question: str):
+    print(f"[RULE] Received question: {question}", flush=True)
     await interaction.response.defer(thinking=True)
+    print(f"[RULE] Deferred response", flush=True)
 
     try:
+        print(f"[RULE] Starting processing...", flush=True)
         # Step 1: Extract keywords with fuzzy correction
         keywords, corrections = extract_keywords_fuzzy(question)
+        print(f"[RULE] Keywords: {keywords}", flush=True)
         
         # Step 2: Expand query with FSAE terminology
+        print(f"[RULE] Expanding query...", flush=True)
         expanded_terms = await expand_query(question)
+        print(f"[RULE] Expanded terms: {expanded_terms}", flush=True)
         all_keywords = list(set(keywords + expanded_terms))
         
         # Step 3: Find relevant sections
+        print(f"[RULE] Finding sections...", flush=True)
         chunks, codes = find_relevant_sections(all_keywords)
+        print(f"[RULE] Found {len(chunks)} chunks", flush=True)
 
         if not chunks:
             # Fallback: try broader search with just fuzzy-corrected keywords
@@ -299,7 +324,9 @@ async def rule_command(interaction: discord.Interaction, question: str):
             return
 
         # Step 4: Get answer from Gemini (includes "Also check" suggestions)
+        print(f"[RULE] Calling Gemini...", flush=True)
         answer = await ask_gemini(question, chunks)
+        print(f"[RULE] Got answer: {len(answer)} chars", flush=True)
 
         # Build response with metadata
         response_parts = []
@@ -363,15 +390,38 @@ async def search_command(interaction: discord.Interaction, term: str):
     await interaction.followup.send(output)
 
 
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    print(f"Command error: {error}")
+    import traceback
+    traceback.print_exception(type(error), error, error.__traceback__)
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(f"Error: {error}")
+        else:
+            await interaction.response.send_message(f"Error: {error}", ephemeral=True)
+    except Exception as e:
+        print(f"Failed to send error message: {e}")
+
+
 @bot.event
 async def on_ready():
-    # Sync to specific guild for instant command updates
-    guild = discord.Object(id=1465062503254982981)
-    tree.copy_global_to(guild=guild)
-    await tree.sync(guild=guild)
-    print(f"FSAE Rules Bot online as {bot.user}")
-    print(f"Loaded {len(RULES_LINES)} lines, {len(SECTION_INDEX)} sections indexed")
-    print(f"Commands synced to guild {guild.id}")
+    try:
+        print(f"on_ready triggered for {bot.user}")
+        guild = discord.Object(id=1465062503254982981)
+        
+        # Sync to guild only (faster than global)
+        print(f"Syncing commands to guild {guild.id}...")
+        tree.copy_global_to(guild=guild)
+        await tree.sync(guild=guild)
+        
+        print(f"FSAE Rules Bot online as {bot.user}")
+        print(f"Loaded {len(RULES_LINES)} lines, {len(SECTION_INDEX)} sections indexed")
+        print(f"Commands synced to guild {guild.id}")
+    except Exception as e:
+        print(f"ERROR in on_ready: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
