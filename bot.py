@@ -183,6 +183,10 @@ def extract_keywords_fuzzy(query):
     corrections = {}
     
     for word in raw_keywords:
+        # Don't fuzzy-correct stop words or very short words
+        if word in STOP_WORDS or len(word) <= 2:
+            corrected.append(word)
+            continue
         corrected_word = fuzzy_correct_keyword(word)
         corrected.append(corrected_word)
         if corrected_word != word:
