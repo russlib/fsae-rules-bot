@@ -195,7 +195,8 @@ Rules:
 - Always cite the specific rule number (e.g., EV.5.3.1, F.10.2.3)
 - Quote the exact rule text when relevant
 - Be concise — Discord has a 2000 char limit
-- If the provided context doesn't contain the answer, say so
+- If there's no explicit rule with a specific number/limit, explain what implicit constraints exist (e.g., "There's no max width specified, but aero must be within tire width per T.7.6")
+- If the context genuinely doesn't help, say so and suggest what terms to search
 - If a rule references another rule, mention the cross-reference
 - At the end, add a line: "**Also check:** [list 2-3 related rule sections that might be relevant]"
   For example: "**Also check:** F.10.4 (Holes and Openings), EV.6.1 (Covers), T.8.2 (Critical Fasteners)"
