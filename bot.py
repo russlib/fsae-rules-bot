@@ -365,9 +365,13 @@ async def search_command(interaction: discord.Interaction, term: str):
 
 @bot.event
 async def on_ready():
-    await tree.sync()
+    # Sync to specific guild for instant command updates
+    guild = discord.Object(id=1465062503254982981)
+    tree.copy_global_to(guild=guild)
+    await tree.sync(guild=guild)
     print(f"FSAE Rules Bot online as {bot.user}")
     print(f"Loaded {len(RULES_LINES)} lines, {len(SECTION_INDEX)} sections indexed")
+    print(f"Commands synced to guild {guild.id}")
 
 
 if __name__ == "__main__":
