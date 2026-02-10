@@ -161,7 +161,7 @@ def extract_keywords(query):
     return keywords if keywords else words
 
 
-def fuzzy_correct_keyword(word, threshold=80):
+def fuzzy_correct_keyword(word, threshold=85):
     """
     Find the best matching word in vocabulary using fuzzy matching.
     Returns the corrected word if a good match is found, otherwise original.
@@ -169,10 +169,16 @@ def fuzzy_correct_keyword(word, threshold=80):
     if word in VOCABULARY:
         return word  # Exact match
     
+    # Don't fuzzy correct short words (too many false positives)
+    if len(word) < 4:
+        return word
+    
     # Find best fuzzy match
     result = process.extractOne(word, VOCABULARY, scorer=fuzz.ratio)
     if result and result[1] >= threshold:
-        return result[0]
+        # Extra check: correction should be similar length (within 2 chars)
+        if abs(len(result[0]) - len(word)) <= 2:
+            return result[0]
     return word
 
 
