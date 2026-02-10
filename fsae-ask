@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# FSAE Rules Query - searches rules + asks Gemini
+# Usage: fsae-ask "What are the battery container requirements?"
+
+set -e
+
+# Resolve symlinks to get actual script location
+SCRIPT_PATH="$(readlink -f "$0")"
+SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
+
+# Load API key from .env if not set
+if [ -z "$GEMINI_API_KEY" ] && [ -f "$SCRIPT_DIR/.env" ]; then
+    export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
+fi
+QUESTION="$*"
+
+if [ -z "$QUESTION" ]; then
+    echo "Usage: fsae-ask <question>"
+    exit 1
+fi
+
+# Get relevant context from rules
+CONTEXT=$(python3 "$SCRIPT_DIR/query.py" "$QUESTION" 2>/dev/null | tail -n +5)
+
+if [ -z "$CONTEXT" ]; then
+    echo "No matching rules found for: $QUESTION"
+    exit 1
+fi
+
+# Build prompt for Gemini
+PROMPT="You are an FSAE Rules expert. Answer this question about Formula SAE 2026 Rules.
+
+Rules:
+- Always cite the specific rule number (e.g., EV.5.3.1, F.10.2.3)
+- Quote exact rule text when relevant
+- Be concise (under 1800 chars)
+- If the context doesn't contain the answer, say so
+
+Question: $QUESTION
+
+Relevant Rules:
+$CONTEXT"
+
+# Query Gemini
+gemini --model gemini-2.0-flash "$PROMPT"

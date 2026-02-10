@@ -9,6 +9,11 @@ Usage:
 Requires:
   DISCORD_BOT_TOKEN  - Discord bot token
   GOOGLE_API_KEY     - Gemini API key
+
+Features:
+  - Fuzzy matching for typos (rapidfuzz)
+  - Query expansion via Gemini for better terminology matching
+  - "Also check" suggestions for related rules
 """
 
 import os
@@ -16,6 +21,7 @@ import re
 import discord
 from discord import app_commands
 from google import genai
+from rapidfuzz import fuzz, process
 
 # Load .env file if present
 ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -48,21 +54,32 @@ SECTION_INDEX = {}
 
 def build_section_index():
     """Build an index of section codes to line ranges."""
-    # Match heading lines: ## EV.5 ENERGY STORAGE or raw lines like EV.5.3.1
     heading_pat = re.compile(r'^#{1,4}\s+([A-Z]{1,2}\.\d{1,2}(?:\.\d{1,2})*)\s')
 
-    sections = []  # (line_num, code)
+    sections = []
     for i, line in enumerate(RULES_LINES):
         m = heading_pat.match(line)
         if m:
             sections.append((i, m.group(1)))
 
-    # Set end of each section to start of next
     for idx, (start, code) in enumerate(sections):
         end = sections[idx + 1][0] if idx + 1 < len(sections) else len(RULES_LINES)
         SECTION_INDEX[code] = (start, end)
 
 build_section_index()
+
+# --- Build vocabulary for fuzzy matching ---
+def build_vocabulary():
+    """Extract unique meaningful words from the rulebook for fuzzy matching."""
+    words = set()
+    for line in RULES_LINES:
+        # Extract words (letters and numbers)
+        found = re.findall(r'[a-zA-Z]{3,}', line)
+        words.update(w.lower() for w in found)
+    return list(words)
+
+VOCABULARY = build_vocabulary()
+print(f"Vocabulary size: {len(VOCABULARY)} unique words")
 
 # --- Search functions ---
 STOP_WORDS = {
@@ -85,19 +102,52 @@ def extract_keywords(query):
     """Extract meaningful keywords from a query, filtering stop words."""
     words = re.findall(r'[a-z0-9]+', query.lower())
     keywords = [w for w in words if w not in STOP_WORDS and len(w) > 1]
-    return keywords if keywords else words  # fallback to all words if everything filtered
+    return keywords if keywords else words
 
 
-def keyword_search(query, context_lines=3, max_results=15):
+def fuzzy_correct_keyword(word, threshold=80):
+    """
+    Find the best matching word in vocabulary using fuzzy matching.
+    Returns the corrected word if a good match is found, otherwise original.
+    """
+    if word in VOCABULARY:
+        return word  # Exact match
+    
+    # Find best fuzzy match
+    result = process.extractOne(word, VOCABULARY, scorer=fuzz.ratio)
+    if result and result[1] >= threshold:
+        return result[0]
+    return word
+
+
+def extract_keywords_fuzzy(query):
+    """Extract keywords with fuzzy correction for typos."""
+    raw_keywords = extract_keywords(query)
+    corrected = []
+    corrections = {}
+    
+    for word in raw_keywords:
+        corrected_word = fuzzy_correct_keyword(word)
+        corrected.append(corrected_word)
+        if corrected_word != word:
+            corrections[word] = corrected_word
+    
+    return corrected, corrections
+
+
+def keyword_search(query, context_lines=3, max_results=15, use_fuzzy=True):
     """Search rules by keywords. Returns list of (line_num, text) tuples."""
-    keywords = extract_keywords(query)
+    if use_fuzzy:
+        keywords, _ = extract_keywords_fuzzy(query)
+    else:
+        keywords = extract_keywords(query)
+    
     results = []
     seen_ranges = set()
 
     for i, line in enumerate(RULES_LINES):
         lower = line.lower()
         if all(w in lower for w in keywords):
-            # Avoid overlapping results
             range_key = i // (context_lines * 2)
             if range_key in seen_ranges:
                 continue
@@ -114,11 +164,8 @@ def keyword_search(query, context_lines=3, max_results=15):
     return results
 
 
-def find_relevant_sections(query, max_sections=5):
-    """Find the most relevant sections for a query using keyword matching."""
-    keywords = extract_keywords(query)
-
-    # Score each section by keyword hits (only meaningful words)
+def find_relevant_sections(keywords, max_sections=5):
+    """Find the most relevant sections for given keywords."""
     scores = {}
     for code, (start, end) in SECTION_INDEX.items():
         section_text = "\n".join(RULES_LINES[start:end]).lower()
@@ -126,17 +173,17 @@ def find_relevant_sections(query, max_sections=5):
         if score > 0:
             scores[code] = score
 
-    # Sort by score descending, return top N
     top = sorted(scores.items(), key=lambda x: -x[1])[:max_sections]
 
-    # Collect the text
     chunks = []
+    codes = []
     for code, score in top:
         start, end = SECTION_INDEX[code]
         text = "\n".join(RULES_LINES[start:end])
         chunks.append(text)
+        codes.append(code)
 
-    return chunks
+    return chunks, codes
 
 
 # --- Gemini client ---
@@ -149,14 +196,44 @@ Rules:
 - Quote the exact rule text when relevant
 - Be concise — Discord has a 2000 char limit
 - If the provided context doesn't contain the answer, say so
-- If a rule references another rule, mention the cross-reference"""
+- If a rule references another rule, mention the cross-reference
+- At the end, add a line: "**Also check:** [list 2-3 related rule sections that might be relevant]"
+  For example: "**Also check:** F.10.4 (Holes and Openings), EV.6.1 (Covers), T.8.2 (Critical Fasteners)"
+  Only suggest sections that exist and are genuinely related."""
+
+
+async def expand_query(question):
+    """Use Gemini to expand the query with FSAE-specific terminology."""
+    expansion_prompt = f"""Given this question about FSAE (Formula SAE) rules, suggest 3-5 specific technical terms 
+that would appear in the official FSAE rulebook. Return ONLY the terms, comma-separated, no explanation.
+
+Common FSAE terminology includes: Tractive System, Accumulator, GLV (Grounded Low Voltage), 
+TSAL (Tractive System Active Light), IMD (Insulation Monitoring Device), HVD (High Voltage Disconnect),
+BSPD (Brake System Plausibility Device), Primary Structure, Major Structure, SES (Structural Equivalency Spreadsheet),
+Critical Fastener, Firewall, Attenuator, etc.
+
+Question: {question}
+
+Terms:"""
+
+    try:
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-lite",
+            contents=expansion_prompt,
+            config=genai.types.GenerateContentConfig(
+                max_output_tokens=100,
+            ),
+        )
+        terms = [t.strip().lower() for t in response.text.split(",")]
+        return [t for t in terms if len(t) > 2][:5]
+    except Exception:
+        return []
 
 
 async def ask_gemini(question, context_chunks):
     """Send question + relevant rule sections to Gemini Flash."""
     context = "\n\n---\n\n".join(context_chunks)
 
-    # Trim context if too long (keep under ~30k chars for speed)
     if len(context) > 30000:
         context = context[:30000] + "\n\n[...truncated]"
 
@@ -191,28 +268,60 @@ async def rule_command(interaction: discord.Interaction, question: str):
     await interaction.response.defer(thinking=True)
 
     try:
-        # Find relevant sections
-        chunks = find_relevant_sections(question)
+        # Step 1: Extract keywords with fuzzy correction
+        keywords, corrections = extract_keywords_fuzzy(question)
+        
+        # Step 2: Expand query with FSAE terminology
+        expanded_terms = await expand_query(question)
+        all_keywords = list(set(keywords + expanded_terms))
+        
+        # Step 3: Find relevant sections
+        chunks, codes = find_relevant_sections(all_keywords)
 
         if not chunks:
-            # Fallback: try broader search
+            # Fallback: try broader search with just fuzzy-corrected keywords
             results = keyword_search(question, context_lines=5, max_results=5)
             chunks = [text for _, text in results]
+            codes = []
 
         if not chunks:
+            # Build helpful error message
+            correction_note = ""
+            if corrections:
+                fixes = [f"'{k}' → '{v}'" for k, v in corrections.items()]
+                correction_note = f"\n(Typo corrections attempted: {', '.join(fixes)})"
+            
             await interaction.followup.send(
-                f"No matching rules found for: **{question}**\n"
-                "Try rephrasing or using specific terms like 'battery container', 'restrictor', 'endurance'."
+                f"No matching rules found for: **{question}**{correction_note}\n"
+                "Try rephrasing or using specific terms like 'tractive system', 'accumulator', 'GLV', 'TSAL'."
             )
             return
 
+        # Step 4: Get answer from Gemini (includes "Also check" suggestions)
         answer = await ask_gemini(question, chunks)
 
-        # Discord 2000 char limit
-        if len(answer) > 1950:
-            answer = answer[:1950] + "\n\n*[truncated]*"
+        # Build response with metadata
+        response_parts = []
+        
+        # Show typo corrections if any
+        if corrections:
+            fixes = [f"`{k}` → `{v}`" for k, v in corrections.items()]
+            response_parts.append(f"📝 *Corrected: {', '.join(fixes)}*")
+        
+        # Show expanded terms if any
+        if expanded_terms:
+            response_parts.append(f"🔍 *Also searched: {', '.join(expanded_terms)}*")
+        
+        response_parts.append(f"**Q:** {question}\n")
+        response_parts.append(answer)
+        
+        full_response = "\n".join(response_parts)
 
-        await interaction.followup.send(f"**Q:** {question}\n\n{answer}")
+        # Discord 2000 char limit
+        if len(full_response) > 1950:
+            full_response = full_response[:1950] + "\n\n*[truncated]*"
+
+        await interaction.followup.send(full_response)
 
     except Exception as e:
         await interaction.followup.send(f"Error: {e}")
@@ -223,15 +332,26 @@ async def rule_command(interaction: discord.Interaction, question: str):
 async def search_command(interaction: discord.Interaction, term: str):
     await interaction.response.defer(thinking=True)
 
-    results = keyword_search(term, context_lines=1, max_results=8)
+    # Apply fuzzy correction
+    keywords, corrections = extract_keywords_fuzzy(term)
+    
+    results = keyword_search(term, context_lines=1, max_results=8, use_fuzzy=True)
 
     if not results:
-        await interaction.followup.send(f"No results for: **{term}**")
+        correction_note = ""
+        if corrections:
+            fixes = [f"'{k}' → '{v}'" for k, v in corrections.items()]
+            correction_note = f"\n(Tried corrections: {', '.join(fixes)})"
+        await interaction.followup.send(f"No results for: **{term}**{correction_note}")
         return
 
-    output = f"**Search: {term}** ({len(results)} results)\n\n"
+    output = f"**Search: {term}** ({len(results)} results)\n"
+    if corrections:
+        fixes = [f"`{k}` → `{v}`" for k, v in corrections.items()]
+        output += f"📝 *Corrected: {', '.join(fixes)}*\n"
+    output += "\n"
+    
     for line_num, text in results:
-        # Clean up for Discord
         clean = text.strip().replace("[[#", "").replace("]]", "")
         entry = f"**Line {line_num}:**\n```\n{clean}\n```\n"
         if len(output) + len(entry) > 1900:
