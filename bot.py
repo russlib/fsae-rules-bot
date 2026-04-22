@@ -39,7 +39,20 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RULES_PATH = os.path.join(SCRIPT_DIR, "FSAE_Rules_2026_V1.md")
 
 DISCORD_TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+
+def _load_api_keys():
+    """Load API keys from GOOGLE_API_KEYS (plural, comma-separated) and GOOGLE_API_KEY (singular)."""
+    keys = []
+    plural = os.environ.get("GOOGLE_API_KEYS", "").strip()
+    if plural:
+        keys.extend(k.strip() for k in plural.split(",") if k.strip())
+    singular = os.environ.get("GOOGLE_API_KEY", "").strip()
+    if singular and singular not in keys:
+        keys.append(singular)
+    return keys
+
+API_KEYS = _load_api_keys()
+GOOGLE_API_KEY = API_KEYS[0] if API_KEYS else ""
 
 # --- Load rules into memory ---
 def load_rules(path):
@@ -253,8 +266,43 @@ def find_relevant_sections(keywords, max_sections=5):
     return chunks, codes
 
 
-# --- Gemini client ---
-client = genai.Client(api_key=GOOGLE_API_KEY)
+# --- Gemini client pool with key rotation on 429 ---
+# Free tier Gemini 2.0 Flash Lite is ~30 RPM per key. With N keys rotating on
+# RESOURCE_EXHAUSTED, effective throughput is ~30*N RPM. When a key 429s we
+# mark it cooling-down for 60s (the RPM reset window) and try the next key.
+_clients: dict[str, "genai.Client"] = {}
+_key_cooldowns: dict[str, float] = {}
+_key_idx = 0
+
+
+def _get_client():
+    """Return (client, key) for the next non-cooling-down key, or the soonest-ready one."""
+    global _key_idx
+    if not API_KEYS:
+        raise RuntimeError("No API keys configured (GOOGLE_API_KEY or GOOGLE_API_KEYS)")
+    now = time.time()
+    n = len(API_KEYS)
+    for offset in range(n):
+        idx = (_key_idx + offset) % n
+        k = API_KEYS[idx]
+        if _key_cooldowns.get(k, 0) <= now:
+            _key_idx = idx
+            if k not in _clients:
+                _clients[k] = genai.Client(api_key=k)
+            return _clients[k], k
+    # All keys cooling down -- wait for the soonest one
+    best = min(API_KEYS, key=lambda k: _key_cooldowns.get(k, 0))
+    wait = max(0, _key_cooldowns[best] - now)
+    if wait > 0:
+        print(f"[pool] all {n} keys cooling, sleeping {wait:.1f}s for soonest key", flush=True)
+        time.sleep(wait)
+    if best not in _clients:
+        _clients[best] = genai.Client(api_key=best)
+    return _clients[best], best
+
+
+# Legacy alias so any older code paths still work
+client = _clients  # type: ignore  # unused directly; routed through _get_client()
 
 SYSTEM_PROMPT = """You are an FSAE Rules expert bot. You answer questions about the Formula SAE 2026 Rules.
 
@@ -281,20 +329,33 @@ def _is_rate_limit_error(exc: Exception) -> bool:
     return "429" in text or "RESOURCE_EXHAUSTED" in upper or "RATE LIMIT" in upper
 
 
-def _generate_with_retry(*, model, contents, config, attempts=3, base_sleep=2.0):
+def _generate_with_retry(*, model, contents, config, attempts=None, base_sleep=2.0):
+    """Try each API key; on 429, mark that key cooling-down 60s and rotate."""
+    global _key_idx
+    if attempts is None:
+        # Give every key at least one shot, plus a couple of retries
+        attempts = max(len(API_KEYS) + 2, 3)
     last_exc = None
     for attempt in range(attempts):
+        active_client, key = _get_client()
         try:
-            return client.models.generate_content(
+            return active_client.models.generate_content(
                 model=model,
                 contents=contents,
                 config=config,
             )
         except Exception as exc:
             last_exc = exc
-            if not _is_rate_limit_error(exc) or attempt == attempts - 1:
+            if not _is_rate_limit_error(exc):
                 raise
-            time.sleep(base_sleep * (2 ** attempt))
+            # Cool this key for 60s (Gemini RPM reset window) and rotate
+            _key_cooldowns[key] = time.time() + 60
+            _key_idx = (_key_idx + 1) % len(API_KEYS)
+            print(f"[pool] key ...{key[-6:]} 429'd, cooling 60s, trying next", flush=True)
+            if attempt == attempts - 1:
+                raise
+            # Brief sleep between rotations so we don't hammer the API
+            time.sleep(min(base_sleep * (2 ** attempt), 5))
     raise last_exc
 
 
