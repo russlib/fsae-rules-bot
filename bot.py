@@ -18,6 +18,7 @@ Features:
 
 import os
 import re
+import time
 import discord
 from discord import app_commands
 from google import genai
@@ -274,6 +275,29 @@ At the end, add a **Follow-up** section with 1-3 copyable prompts for related ru
 Only suggest follow-ups that would genuinely help understand the topic better."""
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    text = str(exc)
+    upper = text.upper()
+    return "429" in text or "RESOURCE_EXHAUSTED" in upper or "RATE LIMIT" in upper
+
+
+def _generate_with_retry(*, model, contents, config, attempts=3, base_sleep=2.0):
+    last_exc = None
+    for attempt in range(attempts):
+        try:
+            return client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if not _is_rate_limit_error(exc) or attempt == attempts - 1:
+                raise
+            time.sleep(base_sleep * (2 ** attempt))
+    raise last_exc
+
+
 async def expand_query(question):
     """Use Gemini to expand the query with FSAE-specific terminology."""
     import asyncio
@@ -291,12 +315,14 @@ Question: {question}
 Terms:"""
 
     def sync_call():
-        response = client.models.generate_content(
+        response = _generate_with_retry(
             model="gemini-2.0-flash-lite",
             contents=expansion_prompt,
             config=genai.types.GenerateContentConfig(
                 max_output_tokens=100,
             ),
+            attempts=2,
+            base_sleep=1.5,
         )
         terms = [t.strip().lower() for t in response.text.split(",")]
         return [t for t in terms if len(t) > 2][:5]
@@ -326,13 +352,15 @@ async def ask_gemini(question, context_chunks):
 
     # Run sync Gemini call in thread pool to not block event loop
     def sync_call():
-        response = client.models.generate_content(
+        response = _generate_with_retry(
             model="gemini-2.0-flash-lite",
             contents=prompt,
             config=genai.types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 max_output_tokens=1800,
             ),
+            attempts=3,
+            base_sleep=2.0,
         )
         return response.text
     
@@ -436,7 +464,12 @@ async def rule_command(interaction: discord.Interaction, question: str):
         await interaction.followup.send(full_response)
 
     except Exception as e:
-        await interaction.followup.send(f"Error: {e}")
+        if _is_rate_limit_error(e):
+            await interaction.followup.send(
+                "Gemini is rate-limited right now (429 RESOURCE_EXHAUSTED). Please try again in a minute or two."
+            )
+        else:
+            await interaction.followup.send(f"Error: {e}")
 
 
 @tree.command(name="rulesearch", description="Search FSAE rules by keyword")
