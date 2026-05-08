@@ -8,9 +8,19 @@ set -e
 SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SCRIPT_PATH")"
 
-# Load API key from .env if not set
-if [ -z "$GEMINI_API_KEY" ] && [ -f "$SCRIPT_DIR/.env" ]; then
-    export $(grep -v '^#' "$SCRIPT_DIR/.env" | xargs)
+# Load API keys from canonical store if not set in environment.
+# Single source of truth: ~/.config/gemini-keys/keys.json (chmod 600, gitignored).
+# Rotate keys there once; every consumer picks them up. No hardcoded keys here.
+KEYS_JSON="$HOME/.config/gemini-keys/keys.json"
+if [ -z "${GOOGLE_API_KEYS:-}" ] && [ -f "$KEYS_JSON" ]; then
+    export GOOGLE_API_KEYS="$(python3 -c 'import json,sys;print(",".join(json.load(open(sys.argv[1]))["workers"]))' "$KEYS_JSON")"
+fi
+if [ -z "${GOOGLE_API_KEY:-}" ] && [ -n "${GOOGLE_API_KEYS:-}" ]; then
+    export GOOGLE_API_KEY="${GOOGLE_API_KEYS%%,*}"
+fi
+if [ -z "${GOOGLE_API_KEY:-}" ] && [ -z "${GOOGLE_API_KEYS:-}" ]; then
+    echo "ERROR: No Gemini API key. Set GOOGLE_API_KEY/GOOGLE_API_KEYS or populate $KEYS_JSON" >&2
+    exit 1
 fi
 QUESTION="$*"
 
