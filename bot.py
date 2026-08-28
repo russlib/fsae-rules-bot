@@ -1,14 +1,19 @@
 """
-FSAE Rules Discord Bot
+FSAE Rules + Wisdom Discord Bot
 Searches FSAE 2026 rulebook and answers questions using Gemini Flash.
+Forwards /wisdom queries to the wisdom-bot HTTP service (Vertex + Gemini).
 
 Usage:
-  /rule <question>  - Ask about any FSAE rule
-  /rulesearch <term> - Raw keyword search, returns matching lines
+  /rule <question>        - Ask about any FSAE rule
+  /rulesearch <term>      - Raw keyword search, returns matching lines
+  /wisdom <question>      - Ask about past team engineering decisions (deep mode)
+  /wisdomsearch <term>    - Quick search results from wisdom corpus (no LLM)
 
 Requires:
-  DISCORD_BOT_TOKEN  - Discord bot token
-  GOOGLE_API_KEY     - Gemini API key
+  DISCORD_BOT_TOKEN   - Discord bot token
+  GOOGLE_API_KEY      - Gemini API key
+  WISDOM_API_URL      - Wisdom service base URL (default http://127.0.0.1:8080)
+  WISDOM_API_KEY      - Bearer token for wisdom service
 
 Features:
   - Fuzzy matching for typos (rapidfuzz)
@@ -16,9 +21,16 @@ Features:
   - "Also check" suggestions for related rules
 """
 
+import asyncio
+import io
+import json
 import os
 import re
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+
 import discord
 from discord import app_commands
 from google import genai
@@ -53,6 +65,16 @@ def _load_api_keys():
 
 API_KEYS = _load_api_keys()
 GOOGLE_API_KEY = API_KEYS[0] if API_KEYS else ""
+
+# Soft client-side throttling to avoid slamming into provider RPM limits.
+# Can be overridden in .env, e.g. GEMINI_MIN_INTERVAL_SECONDS=4
+GEMINI_MIN_INTERVAL_SECONDS = float(os.environ.get("GEMINI_MIN_INTERVAL_SECONDS", "4.0"))
+
+# --- Wisdom HTTP service config ---
+WISDOM_API_URL = os.environ.get("WISDOM_API_URL", "http://127.0.0.1:8080").rstrip("/")
+WISDOM_API_KEY_HTTP = os.environ.get("WISDOM_API_KEY", "")
+WISDOM_DEEP_TIMEOUT = float(os.environ.get("WISDOM_DEEP_TIMEOUT", "90"))
+WISDOM_SHALLOW_TIMEOUT = float(os.environ.get("WISDOM_SHALLOW_TIMEOUT", "30"))
 
 # --- Load rules into memory ---
 def load_rules(path):
@@ -272,11 +294,18 @@ def find_relevant_sections(keywords, max_sections=5):
 # mark it cooling-down for 60s (the RPM reset window) and try the next key.
 _clients: dict[str, "genai.Client"] = {}
 _key_cooldowns: dict[str, float] = {}
+_key_last_used: dict[str, float] = {}
 _key_idx = 0
 
 
+def _key_ready_time(key: str) -> float:
+    cooldown_ready = _key_cooldowns.get(key, 0)
+    interval_ready = _key_last_used.get(key, 0) + GEMINI_MIN_INTERVAL_SECONDS
+    return max(cooldown_ready, interval_ready)
+
+
 def _get_client():
-    """Return (client, key) for the next non-cooling-down key, or the soonest-ready one."""
+    """Return (client, key) for the next ready key, or wait for the soonest-ready one."""
     global _key_idx
     if not API_KEYS:
         raise RuntimeError("No API keys configured (GOOGLE_API_KEY or GOOGLE_API_KEYS)")
@@ -285,16 +314,16 @@ def _get_client():
     for offset in range(n):
         idx = (_key_idx + offset) % n
         k = API_KEYS[idx]
-        if _key_cooldowns.get(k, 0) <= now:
+        if _key_ready_time(k) <= now:
             _key_idx = idx
             if k not in _clients:
                 _clients[k] = genai.Client(api_key=k)
             return _clients[k], k
-    # All keys cooling down -- wait for the soonest one
-    best = min(API_KEYS, key=lambda k: _key_cooldowns.get(k, 0))
-    wait = max(0, _key_cooldowns[best] - now)
+    # All keys unavailable for now, wait for the soonest one
+    best = min(API_KEYS, key=_key_ready_time)
+    wait = max(0, _key_ready_time(best) - now)
     if wait > 0:
-        print(f"[pool] all {n} keys cooling, sleeping {wait:.1f}s for soonest key", flush=True)
+        print(f"[pool] all {n} keys busy/cooling, sleeping {wait:.1f}s for soonest key", flush=True)
         time.sleep(wait)
     if best not in _clients:
         _clients[best] = genai.Client(api_key=best)
@@ -339,6 +368,7 @@ def _generate_with_retry(*, model, contents, config, attempts=None, base_sleep=2
     for attempt in range(attempts):
         active_client, key = _get_client()
         try:
+            _key_last_used[key] = time.time()
             return active_client.models.generate_content(
                 model=model,
                 contents=contents,
@@ -362,6 +392,10 @@ def _generate_with_retry(*, model, contents, config, attempts=None, base_sleep=2
 async def expand_query(question):
     """Use Gemini to expand the query with FSAE-specific terminology."""
     import asyncio
+
+    # If we only have one key, skip the extra Gemini call to reduce latency and quota burn.
+    if len(API_KEYS) <= 1:
+        return []
     
     expansion_prompt = f"""Given this question about FSAE (Formula SAE) rules, suggest 3-5 specific technical terms 
 that would appear in the official FSAE rulebook. Return ONLY the terms, comma-separated, no explanation.
@@ -377,7 +411,7 @@ Terms:"""
 
     def sync_call():
         response = _generate_with_retry(
-            model="gemini-2.0-flash-lite",
+            model="gemini-3.1-flash-lite-preview",
             contents=expansion_prompt,
             config=genai.types.GenerateContentConfig(
                 max_output_tokens=100,
@@ -414,7 +448,7 @@ async def ask_gemini(question, context_chunks):
     # Run sync Gemini call in thread pool to not block event loop
     def sync_call():
         response = _generate_with_retry(
-            model="gemini-2.0-flash-lite",
+            model="gemini-3.1-flash-lite-preview",
             contents=prompt,
             config=genai.types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
@@ -439,10 +473,10 @@ tree = app_commands.CommandTree(bot)
 @app_commands.describe(question="Your question about FSAE rules")
 async def rule_command(interaction: discord.Interaction, question: str):
     print(f"[RULE] Received question: {question}", flush=True)
-    await interaction.response.defer(thinking=True)
-    print(f"[RULE] Deferred response", flush=True)
 
     try:
+        await interaction.response.defer(thinking=True)
+        print(f"[RULE] Deferred response", flush=True)
         print(f"[RULE] Starting processing...", flush=True)
         
         # Step 0: Check for specific rule codes (e.g., T.7.6, EV.5.3)
@@ -525,12 +559,15 @@ async def rule_command(interaction: discord.Interaction, question: str):
         await interaction.followup.send(full_response)
 
     except Exception as e:
-        if _is_rate_limit_error(e):
-            await interaction.followup.send(
-                "Gemini is rate-limited right now (429 RESOURCE_EXHAUSTED). Please try again in a minute or two."
-            )
-        else:
-            await interaction.followup.send(f"Error: {e}")
+        try:
+            if _is_rate_limit_error(e):
+                await interaction.followup.send(
+                    "Gemini is rate-limited right now (429 RESOURCE_EXHAUSTED). Please try again in a minute or two."
+                )
+            else:
+                await interaction.followup.send(f"Error: {e}")
+        except Exception as send_error:
+            print(f"[RULE] Failed to send error response: {send_error}; original error: {e}", flush=True)
 
 
 @tree.command(name="rulesearch", description="Search FSAE rules by keyword")
@@ -566,6 +603,223 @@ async def search_command(interaction: discord.Interaction, term: str):
         output += entry
 
     await interaction.followup.send(output)
+
+
+# --- Wisdom HTTP client (calls wisdom-bot service) ---
+
+def _wisdom_query_sync(question: str, deep: bool, top_n: int) -> dict:
+    if not WISDOM_API_KEY_HTTP:
+        raise RuntimeError("WISDOM_API_KEY not set; /wisdom unavailable")
+    body = {"query": question, "deep": deep, "top_n": top_n}
+    req = urllib.request.Request(
+        f"{WISDOM_API_URL}/query",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {WISDOM_API_KEY_HTTP}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    timeout = WISDOM_DEEP_TIMEOUT if deep else WISDOM_SHALLOW_TIMEOUT
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+async def query_wisdom(question: str, deep: bool = True, top_n: int = 12) -> dict:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _wisdom_query_sync, question, deep, top_n)
+
+
+_SOURCE_LABEL = {
+    "competition_doc":      "🏆 comp doc",
+    "design_review":        "🔍 design review",
+    "design_report":        "📋 design report",
+    "meeting_presentation": "📅 meeting",
+    "maintenance_log":      "📓 log",
+    "data_file":            "📊 data",
+    "code":                 "💻 code",
+    "spreadsheet_calc":     "📈 sheet",
+    "tracker_registry":     "🗂 registry",
+    "presentation":         "🎯 deck",
+    "report":               "📄 report",
+    "document":             "📝 doc",
+    "other":                "❓ other",
+}
+
+
+def _format_result_line(r: dict, idx: int) -> str:
+    year = r.get("car_year") or "—"
+    title = (r.get("title") or r.get("original_path", "?"))[:75]
+    subsys = r.get("subsystem", "")
+    url = r.get("sharepoint_url", "")
+    st = r.get("source_type", "")
+    st_label = _SOURCE_LABEL.get(st, "")
+    line = f"`[{idx}]` **[{year}]** {title}"
+    tags = []
+    if st_label:
+        tags.append(st_label)
+    if subsys:
+        tags.append(f"_{subsys}_")
+    if tags:
+        line += "  · " + "  · ".join(tags)
+    if url:
+        line += f"\n     <{url}>"
+    return line
+
+
+def _build_wisdom_markdown(question: str, answer: str, results: list, meta: dict) -> str:
+    """Full wisdom response as a portable markdown doc (Obsidian-friendly)."""
+    lines = [
+        f"# {question}",
+        "",
+        f"_Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} via /wisdom (Vertex + Gemini)_",
+        "",
+    ]
+    if meta:
+        lines.append(
+            f"_Synthesis context: {meta.get('docs_loaded', 0)} documents, "
+            f"{meta.get('chars_total', 0):,} chars"
+            f"{' (truncated to budget)' if meta.get('truncated') else ''}._"
+        )
+        lines.append("")
+    lines.append("## Answer")
+    lines.append("")
+    lines.append(answer)
+    lines.append("")
+    if results:
+        lines.append("## Sources")
+        lines.append("")
+        for i, r in enumerate(results, 1):
+            year = r.get("car_year") or "—"
+            title = r.get("title") or r.get("original_path", "?")
+            subsys = r.get("subsystem", "")
+            doc_type = r.get("doc_type", "")
+            path = r.get("original_path", "")
+            url = r.get("sharepoint_url", "")
+            st = r.get("source_type", "")
+            qt = r.get("quality_tier")
+            lines.append(f"### [{i}] {title}")
+            lines.append("")
+            lines.append(f"- **Car year:** {year}")
+            if subsys:
+                lines.append(f"- **Subsystem:** {subsys}")
+            if st:
+                qt_str = f" (tier {qt})" if qt is not None else ""
+                lines.append(f"- **Source type:** {st}{qt_str}")
+            if doc_type:
+                lines.append(f"- **File type:** {doc_type}")
+            if path:
+                lines.append(f"- **Path:** `{path}`")
+            if url:
+                lines.append(f"- **SharePoint:** {url}")
+            alt = r.get("alt_paths") or []
+            if alt:
+                lines.append(f"- **Also at {len(alt)} other location{'s' if len(alt) > 1 else ''}:**")
+                for p in alt[:10]:
+                    lines.append(f"  - `{p}`")
+                if len(alt) > 10:
+                    lines.append(f"  - … +{len(alt) - 10} more")
+            lines.append("")
+    return "\n".join(lines)
+
+
+def _slugify(s: str, max_len: int = 40) -> str:
+    s = re.sub(r"[^a-zA-Z0-9]+", "-", s.lower()).strip("-")
+    return s[:max_len] or "wisdom"
+
+
+@tree.command(name="wisdom", description="Ask about past FSAE team engineering decisions (Vertex + Gemini)")
+@app_commands.describe(question="Your question about past team engineering work")
+async def wisdom_command(interaction: discord.Interaction, question: str):
+    print(f"[WISDOM] Received: {question}", flush=True)
+    await interaction.response.defer(thinking=True)
+
+    try:
+        data = await query_wisdom(question, deep=True, top_n=12)
+        answer = data.get("answer") or "(no answer returned)"
+        results = data.get("results", []) or []
+        meta = data.get("meta", {}) or {}
+
+        meta_line = ""
+        if meta:
+            meta_line = (
+                f"\n_(deep · {meta.get('docs_loaded', 0)} docs / "
+                f"{meta.get('chars_total', 0):,} chars"
+                f"{' · truncated' if meta.get('truncated') else ''})_"
+            )
+
+        sources = ""
+        if results:
+            sources = "\n\n**Sources:**\n" + "\n".join(
+                _format_result_line(r, i + 1) for i, r in enumerate(results[:5])
+            )
+
+        full_inline = f"**Q:** {question}{meta_line}\n\n{answer}{sources}"
+
+        # Fits in one message → send as-is.
+        if len(full_inline) <= 1950:
+            await interaction.followup.send(full_inline)
+            return
+
+        # Otherwise: short summary inline + full markdown attachment.
+        # Pull first paragraph or 600 chars of answer for the inline preview.
+        first_para = answer.split("\n\n", 1)[0]
+        if len(first_para) > 700:
+            first_para = first_para[:700].rsplit(" ", 1)[0] + "…"
+        snippet = (
+            f"**Q:** {question}{meta_line}\n\n"
+            f"{first_para}\n\n"
+            f"_Full answer + all sources attached as markdown._"
+            f"{sources}"
+        )
+        # If even snippet+sources is over budget, drop sources to attachment only.
+        if len(snippet) > 1950:
+            snippet = (
+                f"**Q:** {question}{meta_line}\n\n"
+                f"{first_para}\n\n"
+                f"_Full answer + sources attached as markdown ({len(results)} sources)._"
+            )
+            if len(snippet) > 1950:
+                snippet = snippet[:1900] + "…\n\n_(see attachment)_"
+
+        md_body = _build_wisdom_markdown(question, answer, results, meta)
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        filename = f"wisdom-{ts}-{_slugify(question)}.md"
+        file = discord.File(io.BytesIO(md_body.encode("utf-8")), filename=filename)
+        await interaction.followup.send(snippet, file=file)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        await interaction.followup.send(f"Wisdom service HTTP {e.code}: {body}")
+    except Exception as e:
+        await interaction.followup.send(f"Wisdom error: {e}")
+
+
+@tree.command(name="wisdomsearch", description="Quick keyword search over team engineering knowledge")
+@app_commands.describe(term="Keywords to search for")
+async def wisdom_search_command(interaction: discord.Interaction, term: str):
+    print(f"[WISDOMSEARCH] Received: {term}", flush=True)
+    await interaction.response.defer(thinking=True)
+
+    try:
+        data = await query_wisdom(term, deep=False, top_n=10)
+        results = data.get("results", []) or []
+        if not results:
+            await interaction.followup.send(f"No results for: **{term}**")
+            return
+
+        output = f"**Wisdom search: {term}** ({len(results)} results)\n\n"
+        for i, r in enumerate(results, 1):
+            entry = _format_result_line(r, i) + "\n"
+            if len(output) + len(entry) > 1900:
+                output += "*[more results truncated]*"
+                break
+            output += entry
+        await interaction.followup.send(output)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:300]
+        await interaction.followup.send(f"Wisdom service HTTP {e.code}: {body}")
+    except Exception as e:
+        await interaction.followup.send(f"Wisdom error: {e}")
 
 
 @tree.error
